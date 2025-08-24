@@ -1,0 +1,98 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Target Scoring Dashboard</title>
+  <style>
+    body{font-family:Arial,sans-serif;margin:20px} select,button{padding:6px 10px}
+    #status{margin-left:10px;color:#c00;font-weight:bold}
+    #score{font-weight:bold}
+    #preview{display:block;margin-top:12px;max-width:100%;border:1px solid #333}
+  </style>
+</head>
+<body>
+  <h1>Target Scoring Dashboard</h1>
+  <div>
+    Camera:
+    <select id="cam"></select>
+    <button id="start">Start</button>
+    <button id="stop" disabled>Stop</button>
+    <span id="status"></span>
+  </div>
+  <div style="margin-top:10px;">Score: <span id="score">N/A</span></div>
+  <img id="preview" alt="preview" />
+
+  <script>
+    const camSel = document.getElementById('cam');
+    const startBtn = document.getElementById('start');
+    const stopBtn  = document.getElementById('stop');
+    const statusEl = document.getElementById('status');
+    const scoreEl  = document.getElementById('score');
+    const imgEl    = document.getElementById('preview');
+
+    let currentCam = null;
+
+    function setCams(list){
+      camSel.innerHTML = '';
+      if (!list || list.length===0){
+        const opt = document.createElement('option');
+        opt.value = ''; opt.textContent='-- No cameras --';
+        camSel.appendChild(opt);
+        camSel.disabled = true;
+        startBtn.disabled = true;
+        stopBtn.disabled = true;
+        statusEl.textContent = 'Pi offline / no cameras.';
+        scoreEl.textContent = 'N/A';
+        imgEl.src = '';
+        currentCam = null;
+        return;
+      }
+      list.forEach(c=>{
+        const opt = document.createElement('option');
+        opt.value=c; opt.textContent=c;
+        camSel.appendChild(opt);
+      });
+      camSel.disabled = false;
+      startBtn.disabled = false;
+      statusEl.textContent = '';
+    }
+
+    const wsProto = location.protocol === 'https:' ? 'wss' : 'ws';
+    const ws = new WebSocket(`${wsProto}://${location.host}/ws/client`);
+    ws.onmessage = (ev)=>{
+      const msg = JSON.parse(ev.data);
+      if (msg.action==='cameras') setCams(msg.cameras);
+      if (msg.action==='result' && msg.cam_id===currentCam){
+        scoreEl.textContent = msg.score;
+        imgEl.src = `data:image/jpeg;base64,${msg.image}`;
+      }
+    };
+    ws.onclose = ()=> statusEl.textContent = 'Lost connection to server.';
+
+    startBtn.onclick = ()=>{
+      const cam = camSel.value;
+      if (!cam) return;
+      currentCam = cam;
+      startBtn.disabled = true;
+      stopBtn.disabled = false;
+      camSel.disabled = true;
+      statusEl.textContent = `Starting ${cam}...`;
+      fetch(`/start/${cam}`).then(r=>r.json()).then(j=>{
+        statusEl.textContent = (j.status==='ok') ? `Streaming ${cam}` : (j.detail || 'Error');
+      }).catch(()=> statusEl.textContent = 'Error contacting server.');
+    };
+
+    stopBtn.onclick = ()=>{
+      if (!currentCam) return;
+      const cam = currentCam;
+      fetch(`/stop/${cam}`).finally(()=>{
+        statusEl.textContent = `Stopped ${cam}`;
+        startBtn.disabled = false;
+        stopBtn.disabled = true;
+        camSel.disabled = false;
+        currentCam = null;
+      });
+    };
+  </script>
+</body>
+</html>
