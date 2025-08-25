@@ -2,97 +2,263 @@
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>Target Scoring Dashboard</title>
+  <title>Target Scoring Dashboard (React)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
-    body{font-family:Arial,sans-serif;margin:20px} select,button{padding:6px 10px}
-    #status{margin-left:10px;color:#c00;font-weight:bold}
-    #score{font-weight:bold}
-    #preview{display:block;margin-top:12px;max-width:100%;border:1px solid #333}
+    body{font-family:Arial,Helvetica,sans-serif;margin:20px}
+    .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+    select,button{padding:6px 10px;font-size:14px}
+    .status{margin-left:8px;font-weight:bold}
+    .status.err{color:#c00}
+    .status.ok{color:#0a0}
+    .score{margin-top:10px;font-size:16px}
+    img#preview{display:block;margin-top:12px;max-width:100%;border:1px solid #333}
+    .badge{display:inline-block;padding:2px 6px;border-radius:6px;background:#eee;font-size:12px;margin-left:6px}
+    .badge.ok{background:#d7ffd7;border:1px solid #8ac78a}
+    .badge.off{background:#ffe0e0;border:1px solid #e9a1a1}
+    .pill{padding:2px 8px;border-radius:999px;border:1px solid #999;font-size:12px}
+    .pill.on{background:#d7ffd7;border-color:#8ac78a}
+    .pill.off{background:#eee}
   </style>
 </head>
 <body>
   <h1>Target Scoring Dashboard</h1>
-  <div>
-    Camera:
-    <select id="cam"></select>
-    <button id="start">Start</button>
-    <button id="stop" disabled>Stop</button>
-    <span id="status"></span>
-  </div>
-  <div style="margin-top:10px;">Score: <span id="score">N/A</span></div>
-  <img id="preview" alt="preview" />
+  <div id="root"></div>
+
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
 
   <script>
-    const camSel = document.getElementById('cam');
-    const startBtn = document.getElementById('start');
-    const stopBtn  = document.getElementById('stop');
-    const statusEl = document.getElementById('status');
-    const scoreEl  = document.getElementById('score');
-    const imgEl    = document.getElementById('preview');
+    (function () {
+      const { useEffect, useMemo, useRef, useState } = React;
 
-    let currentCam = null;
+      const LS_KEY = "target-dashboard-state-v1";
+      const loadLocal = () => { try { return JSON.parse(localStorage.getItem(LS_KEY) || "{}"); } catch { return {}; } };
+      const saveLocal = (data) => { try { localStorage.setItem(LS_KEY, JSON.stringify(data)); } catch {} };
 
-    function setCams(list){
-      camSel.innerHTML = '';
-      if (!list || list.length===0){
-        const opt = document.createElement('option');
-        opt.value = ''; opt.textContent='-- No cameras --';
-        camSel.appendChild(opt);
-        camSel.disabled = true;
-        startBtn.disabled = true;
-        stopBtn.disabled = true;
-        statusEl.textContent = 'Pi offline / no cameras.';
-        scoreEl.textContent = 'N/A';
-        imgEl.src = '';
-        currentCam = null;
-        return;
+      function useStableWs(url) {
+        const [ready, setReady] = useState(false);
+        const [lastMessage, setLastMessage] = useState(null);
+        const wsRef = useRef(null);
+        const timerRef = useRef(null);
+
+        const connect = () => {
+          try {
+            const ws = new WebSocket(url);
+            wsRef.current = ws;
+            ws.onopen = () => setReady(true);
+            ws.onclose = () => {
+              setReady(false);
+              clearTimeout(timerRef.current);
+              timerRef.current = setTimeout(connect, 1500);
+            };
+            ws.onerror = () => { try { ws.close(); } catch (e) {} };
+            ws.onmessage = (ev) => { try { setLastMessage(JSON.parse(ev.data)); } catch {} };
+          } catch (e) {
+            setReady(false);
+            clearTimeout(timerRef.current);
+            timerRef.current = setTimeout(connect, 2000);
+          }
+        };
+
+        useEffect(() => {
+          connect();
+          return () => {
+            clearTimeout(timerRef.current);
+            if (wsRef.current) try { wsRef.current.close(); } catch(e){}
+          };
+        }, [url]);
+
+        return { ready, lastMessage };
       }
-      list.forEach(c=>{
-        const opt = document.createElement('option');
-        opt.value=c; opt.textContent=c;
-        camSel.appendChild(opt);
-      });
-      camSel.disabled = false;
-      startBtn.disabled = false;
-      statusEl.textContent = '';
-    }
 
-    const wsProto = location.protocol === 'https:' ? 'wss' : 'ws';
-    const ws = new WebSocket(`${wsProto}://${location.host}/ws/client`);
-    ws.onmessage = (ev)=>{
-      const msg = JSON.parse(ev.data);
-      if (msg.action==='cameras') setCams(msg.cameras);
-      if (msg.action==='result' && msg.cam_id===currentCam){
-        scoreEl.textContent = msg.score;
-        imgEl.src = `data:image/jpeg;base64,${msg.image}`;
+      function App() {
+        // Initialize from localStorage so refresh shows instantly
+        const init = loadLocal();
+
+        const [cameras, setCameras] = useState(init.cameras || []);
+        const [active, setActive] = useState(new Set(init.active || []));
+        const [currentCam, setCurrentCam] = useState(init.currentCam || null);
+        const [statusMsg, setStatusMsg] = useState("");
+        const [score, setScore] = useState(init.score ?? "N/A");
+        const [imgSrc, setImgSrc] = useState(init.imgSrc || "");
+        const [startBusy, setStartBusy] = useState(false);
+        const [stopBusy, setStopBusy] = useState(false);
+
+        // Persist to localStorage
+        useEffect(() => {
+          saveLocal({
+            cameras,
+            active: Array.from(active),
+            currentCam,
+            score,
+            imgSrc
+          });
+        }, [cameras, active, currentCam, score, imgSrc]);
+
+        const wsUrl = useMemo(() => {
+          const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+          return proto + '://' + location.host + '/ws/client';
+        }, []);
+        const { ready: wsReady, lastMessage } = useStableWs(wsUrl);
+
+        // compute mutual exclusivity for buttons
+        const isActive = currentCam ? active.has(currentCam) : false;
+        const canStart = !!(cameras.length && (currentCam || cameras[0])) && !startBusy && !stopBusy && !isActive;
+        const canStop  = !!currentCam && !stopBusy && isActive;
+
+        // Handle server messages
+        useEffect(() => {
+          if (!lastMessage) return;
+
+          if (lastMessage.action === "snapshot") {
+            const list = Array.isArray(lastMessage.cameras) ? lastMessage.cameras : [];
+            setCameras(list);
+            const act = new Set(Array.isArray(lastMessage.active) ? lastMessage.active : []);
+            setActive(act);
+
+            const lr = lastMessage.last_results || {};
+            if (currentCam && lr[currentCam]) {
+              setScore(lr[currentCam].score ?? "N/A");
+              if (lr[currentCam].image) setImgSrc("data:image/jpeg;base64," + lr[currentCam].image);
+            } else if (!currentCam && list.length > 0) {
+              const firstActive = list.find(c => act.has(c));
+              const fallback = firstActive || list[0];
+              setCurrentCam(fallback);
+              if (lr[fallback]) {
+                setScore(lr[fallback].score ?? "N/A");
+                if (lr[fallback].image) setImgSrc("data:image/jpeg;base64," + lr[fallback].image);
+              } else {
+                setScore("N/A"); setImgSrc("");
+              }
+            } else if (list.length === 0) {
+              setStatusMsg("Pi offline / no cameras.");
+              setCurrentCam(null); setScore("N/A"); setImgSrc("");
+            } else {
+              setStatusMsg("");
+            }
+          }
+
+          if (lastMessage.action === "result") {
+            if (lastMessage.cam_id && lastMessage.cam_id === currentCam) {
+              setScore(lastMessage.score ?? "N/A");
+              if (lastMessage.image) setImgSrc("data:image/jpeg;base64," + lastMessage.image);
+            }
+          }
+        }, [lastMessage, currentCam]);
+
+        const onChangeCam = (e) => {
+          const v = e.target.value || null;
+          setCurrentCam(v);
+          setStatusMsg("");
+        };
+
+        const startStream = async () => {
+          const cam = currentCam || cameras[0];
+          if (!cam || !canStart) return;
+          setStartBusy(true);
+          setStatusMsg(`Starting ${cam}...`);
+          try {
+            const r = await fetch(`/start/${encodeURIComponent(cam)}`);
+            const j = await r.json();
+            if (j.status === "ok") {
+              setStatusMsg(`Streaming ${cam}`);
+              setActive(prev => new Set(prev).add(cam));
+            } else {
+              setStatusMsg(j.detail || "Error starting");
+            }
+          } catch {
+            setStatusMsg("Error contacting server.");
+          } finally {
+            setStartBusy(false);
+          }
+        };
+
+        const stopStream = async () => {
+          if (!currentCam || !canStop) return;
+          const cam = currentCam;
+          setStopBusy(true);
+          try {
+            const r = await fetch(`/stop/${encodeURIComponent(cam)}`);
+            const j = await r.json();
+            if (j.status === "ok") {
+              setStatusMsg(`Stopped ${cam}`);
+              setActive(prev => { const n = new Set(prev); n.delete(cam); return n; });
+            } else {
+              setStatusMsg(j.detail || "Error stopping");
+            }
+          } catch {
+            setStatusMsg("Error contacting server.");
+          } finally {
+            setStopBusy(false);
+          }
+          // Keep last image & score visible after stop
+        };
+
+        return React.createElement(
+          "div",
+          null,
+          React.createElement(
+            "div",
+            { className: "row" },
+            React.createElement("div", null, "Camera: "),
+            React.createElement(
+              "select",
+              {
+                id: "cam",
+                value: currentCam || "",
+                onChange: onChangeCam,
+                disabled: cameras.length === 0 || startBusy || stopBusy
+              },
+              cameras.length === 0
+                ? React.createElement("option", { value: "" }, "-- No cameras --")
+                : cameras.map((c) =>
+                    React.createElement("option", { key: c, value: c }, c)
+                  )
+            ),
+            React.createElement(
+              "button",
+              { id: "start", onClick: startStream, disabled: !canStart },
+              startBusy ? "Starting..." : "Start"
+            ),
+            React.createElement(
+              "button",
+              { id: "stop", onClick: stopStream, disabled: !canStop },
+              stopBusy ? "Stopping..." : "Stop"
+            ),
+            React.createElement(
+              "span",
+              { className: "badge " + (wsReady ? "ok" : "off") },
+              wsReady ? "WS connected" : "WS offline"
+            ),
+            React.createElement(
+              "span",
+              { id: "status", className: "status " + (statusMsg ? "err" : "") },
+              statusMsg
+            ),
+            cameras.length > 0 && React.createElement(
+              "span",
+              { className: "pill " + (isActive ? "on" : "off") },
+              currentCam ? (isActive ? "active" : "idle") : "idle"
+            )
+          ),
+          React.createElement(
+            "div",
+            { className: "score" },
+            "Score: ",
+            React.createElement("span", { id: "score" }, String(score))
+          ),
+          React.createElement("img", {
+            id: "preview",
+            alt: "preview",
+            src: imgSrc
+          })
+        );
       }
-    };
-    ws.onclose = ()=> statusEl.textContent = 'Lost connection to server.';
 
-    startBtn.onclick = ()=>{
-      const cam = camSel.value;
-      if (!cam) return;
-      currentCam = cam;
-      startBtn.disabled = true;
-      stopBtn.disabled = false;
-      camSel.disabled = true;
-      statusEl.textContent = `Starting ${cam}...`;
-      fetch(`/start/${cam}`).then(r=>r.json()).then(j=>{
-        statusEl.textContent = (j.status==='ok') ? `Streaming ${cam}` : (j.detail || 'Error');
-      }).catch(()=> statusEl.textContent = 'Error contacting server.');
-    };
-
-    stopBtn.onclick = ()=>{
-      if (!currentCam) return;
-      const cam = currentCam;
-      fetch(`/stop/${cam}`).finally(()=>{
-        statusEl.textContent = `Stopped ${cam}`;
-        startBtn.disabled = false;
-        stopBtn.disabled = true;
-        camSel.disabled = false;
-        currentCam = null;
-      });
-    };
+      const root = ReactDOM.createRoot(document.getElementById("root"));
+      root.render(React.createElement(App));
+    })();
   </script>
 </body>
 </html>

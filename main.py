@@ -1,149 +1,255 @@
-# main.py (FastAPI backend server)
+from __future__ import annotations
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 import asyncio, json, base64
+from typing import Optional, Set, Dict, Any
+
 import numpy as np
 import cv2
 
 app = FastAPI()
 
-# Global state (could also use app.state or dependency injection)
-rpi_connection: WebSocket = None       # WebSocket connection to Raspberry Pi
-available_cameras: list[str] = []      # list of camera IDs from the Pi
-frontend_connections: list[WebSocket] = []  # list of active frontend client websockets
+# -----------------------------
+# Global state
+# -----------------------------
+rpi_connection: Optional[WebSocket] = None          # single Raspberry Pi/Ubuntu client
+available_cameras: list[str] = []                   # from Pi "register"
+frontend_connections: Set[WebSocket] = set()        # many admin browser clients
+state_lock = asyncio.Lock()                         # serialize state mutations
 
-# Placeholder for the model (replace with actual model loading)
+# Track which cameras are actively streaming
+active_cameras: Set[str] = set()
+
+# Cache last result per camera: {"score": int, "image": base64_jpg}
+last_results: Dict[str, Dict[str, Any]] = {}
+
+
+# -----------------------------
+# Dummy model (replace with real one later)
+# -----------------------------
 class DummyModel:
     def detect(self, image):
-        # Dummy detection: returns empty list (no bullet holes)
-        # Replace with actual detection logic (e.g., ML model inference)
-        return []
+        return []  # demo: no detections
 model = DummyModel()
 
 def calculate_score(bullet_holes):
-    """Calculate score based on bullet hole coordinates. (Dummy implementation)"""
     score = 0
     for (x, y) in bullet_holes:
-        # Example logic: closer to center = higher score (you can implement real scoring)
-        # Here we'll just give a fixed score per hole for demo.
         score += 10
     return score
 
+
+# -----------------------------
+# Utilities
+# -----------------------------
+async def broadcast_json(payload: dict):
+    """Send payload to all admin clients; remove any dead sockets."""
+    dead = []
+    for ws in list(frontend_connections):
+        try:
+            await ws.send_json(payload)
+        except Exception:
+            dead.append(ws)
+    for ws in dead:
+        try:
+            frontend_connections.remove(ws)
+        except KeyError:
+            pass
+
+def build_snapshot() -> dict:
+    """Full state snapshot for (re)connecting admin clients."""
+    return {
+        "action": "snapshot",
+        "cameras": available_cameras,
+        "active": list(active_cameras),
+        "last_results": last_results,  # { cam_id: {score, image(b64)} }
+    }
+
+
+# -----------------------------
+# Routes
+# -----------------------------
 @app.get("/")
 async def serve_frontend():
-    """Serves the admin panel HTML page."""
-    # Assume there's an index.html file in the same directory (simple static file serve)
-    html_content = ""
-    with open("index.html", "r") as f:
-        html_content = f.read()
-    return HTMLResponse(content=html_content, status_code=200)
+    """Serve index.html from the same directory."""
+    with open("index.html", "r", encoding="utf-8") as f:
+        return HTMLResponse(content=f.read(), status_code=200)
+
 
 @app.websocket("/ws/rpi")
 async def ws_rpi_endpoint(websocket: WebSocket):
-    """WebSocket endpoint for Raspberry Pi client."""
+    """
+    WebSocket for Raspberry Pi/Ubuntu client.
+
+    Pi sends:
+      - {"action":"register","cameras":[...]}
+      - {"action":"frame","cam_id":"cam1","frame":"<base64 jpg>"}
+
+    Server sends:
+      - {"action":"start","cam_id":"cam1"}
+      - {"action":"stop","cam_id":"cam1"}
+      - {"action":"stop_all"}
+    """
     global rpi_connection, available_cameras
     await websocket.accept()
-    rpi_connection = websocket
+
+    async with state_lock:
+        rpi_connection = websocket
+
     try:
-        # Listen for messages from Raspberry Pi
         while True:
-            msg = await websocket.receive_text()  # receive text frames (JSON from Pi)
-            data = json.loads(msg)
+            data = await websocket.receive_json()
             action = data.get("action")
+
             if action == "register":
-                # Pi is registering its cameras
-                available_cameras = data.get("cameras", [])
-                print(f"RPi connected. Available cameras: {available_cameras}")
-                # Notify any connected frontend clients about new cameras
-                for client in frontend_connections:
-                    await client.send_json({"action": "cameras", "cameras": available_cameras})
+                cams = data.get("cameras", [])
+                if not isinstance(cams, list):
+                    cams = []
+                async with state_lock:
+                    available_cameras = cams
+                    active_cameras.intersection_update(cams)  # drop actives that disappeared
+                await broadcast_json(build_snapshot())
+
             elif action == "frame":
-                # Received a frame from a camera
                 cam_id = data.get("cam_id")
                 frame_b64 = data.get("frame")
-                if cam_id and frame_b64:
-                    # Decode the base64 image back to bytes
+                if not (cam_id and frame_b64):
+                    continue
+
+                try:
                     frame_bytes = base64.b64decode(frame_b64)
-                    # Convert bytes to numpy array and decode to image
                     jpg_array = np.frombuffer(frame_bytes, dtype=np.uint8)
                     frame = cv2.imdecode(jpg_array, cv2.IMREAD_COLOR)
                     if frame is None:
-                        print("Failed to decode image from camera:", cam_id)
                         continue
-                    # Run the bullet hole detection model
-                    bullet_holes = model.detect(frame)  # list of (x, y) coordinates
-                    # Calculate the score for this frame (or cumulative – depending on usage)
+
+                    bullet_holes = model.detect(frame)
                     score = calculate_score(bullet_holes)
-                    # Annotate the frame with bullet hole markers (red circles)
+
                     for (x, y) in bullet_holes:
                         cv2.circle(frame, (x, y), radius=15, color=(0, 0, 255), thickness=3)
-                    # Encode the annotated image to JPEG
-                    _, buffer = cv2.imencode('.jpg', frame)
-                    annotated_b64 = base64.b64encode(buffer).decode('utf-8')
-                    # Create result message
-                    result_msg = {
-                        "action": "result",
-                        "cam_id": cam_id,
-                        "score": score,
-                        "image": annotated_b64
-                    }
-                    # Send to all connected frontend clients
-                    for client in frontend_connections:
-                        await client.send_json(result_msg)
-            # (Ignore other actions or unknown messages)
+
+                    ok, buffer = cv2.imencode(".jpg", frame)
+                    if not ok:
+                        continue
+                    annotated_b64 = base64.b64encode(buffer).decode("utf-8")
+
+                    async with state_lock:
+                        last_results[cam_id] = {"score": score, "image": annotated_b64}
+                except Exception:
+                    continue
+
+                await broadcast_json({
+                    "action": "result",
+                    "cam_id": cam_id,
+                    "score": score,
+                    "image": annotated_b64
+                })
+
+            # ignore unknown actions
+
     except WebSocketDisconnect:
-        # Handle the Pi disconnecting
-        print("Raspberry Pi disconnected.")
-        rpi_connection = None
-        available_cameras = []
-        # Notify frontends that cameras are gone/offline (could send an empty list or a special message)
-        for client in frontend_connections:
-            await client.send_json({"action": "cameras", "cameras": []})
-    except Exception as e:
-        print("Error in RPi WebSocket handler:", e)
-        # If any exception, also treat as disconnect/cleanup
-        rpi_connection = None
-        available_cameras = []
-        for client in frontend_connections:
-            await client.send_json({"action": "cameras", "cameras": []})
+        pass
+    except Exception:
+        pass
+    finally:
+        async with state_lock:
+            if rpi_connection is websocket:
+                rpi_connection = None
+            available_cameras = []
+            active_cameras.clear()
+            last_results.clear()
+        await broadcast_json(build_snapshot())
+
 
 @app.websocket("/ws/client")
 async def ws_client_endpoint(websocket: WebSocket):
-    """WebSocket endpoint for admin frontend clients."""
+    """WebSocket for admin browser clients."""
     await websocket.accept()
-    frontend_connections.append(websocket)
-    # Immediately send current camera list to the new client
-    await websocket.send_json({"action": "cameras", "cameras": available_cameras})
+    async with state_lock:
+        frontend_connections.add(websocket)
+
+    # Send a full snapshot immediately (so refresh restores state)
+    try:
+        await websocket.send_json(build_snapshot())
+    except Exception:
+        async with state_lock:
+            frontend_connections.discard(websocket)
+        return
+
     try:
         while True:
-            # In this simple design, we don't expect to receive messages from frontend
-            # If needed, you could handle incoming messages here.
-            await asyncio.sleep(3600)  # keep alive (or handle ping-pong elsewhere)
+            # keepalive; updates are pushed from elsewhere
+            await asyncio.sleep(60)
     except WebSocketDisconnect:
-        frontend_connections.remove(websocket)
-    except Exception as e:
-        print("Error in client WebSocket:", e)
-        if websocket in frontend_connections:
-            frontend_connections.remove(websocket)
+        pass
+    except Exception:
+        pass
+    finally:
+        async with state_lock:
+            frontend_connections.discard(websocket)
+
 
 @app.get("/start/{cam_id}")
 async def start_camera(cam_id: str):
-    """HTTP endpoint to start streaming a given camera."""
-    if rpi_connection is None:
+    """Tell the Pi to start streaming a given camera."""
+    async with state_lock:
+        ws = rpi_connection
+        cams = set(available_cameras)
+        already_active = cam_id in active_cameras
+    if ws is None:
         return {"status": "error", "detail": "Raspberry Pi not connected"}
-    if cam_id not in available_cameras:
+    if cam_id not in cams:
         return {"status": "error", "detail": f"Camera {cam_id} not available"}
-    # Send start command to RPi via WebSocket
-    cmd = {"action": "start", "cam_id": cam_id}
-    await rpi_connection.send_json(cmd)
-    return {"status": "ok", "detail": f"Start command sent for {cam_id}"}
+
+    # Guard duplicate start
+    if already_active:
+        return {"status": "ok", "detail": f"{cam_id} already running"}
+
+    try:
+        await ws.send_json({"action": "start", "cam_id": cam_id})
+        async with state_lock:
+            active_cameras.add(cam_id)
+        await broadcast_json(build_snapshot())
+        return {"status": "ok", "detail": f"Start command sent for {cam_id}"}
+    except Exception as e:
+        return {"status": "error", "detail": f"Failed to send start: {e}"}
+
 
 @app.get("/stop/{cam_id}")
 async def stop_camera(cam_id: str):
-    """HTTP endpoint to stop streaming a given camera."""
-    if rpi_connection is None:
+    """Tell the Pi to stop streaming a given camera (keep last image/score cached)."""
+    async with state_lock:
+        ws = rpi_connection
+        is_active = cam_id in active_cameras
+    if ws is None:
         return {"status": "error", "detail": "Raspberry Pi not connected"}
-    # Send stop command to RPi via WebSocket
-    cmd = {"action": "stop", "cam_id": cam_id}
-    await rpi_connection.send_json(cmd)
-    return {"status": "ok", "detail": f"Stop command sent for {cam_id}"}
+
+    # Guard duplicate stop
+    if not is_active:
+        return {"status": "ok", "detail": f"{cam_id} already stopped"}
+
+    try:
+        await ws.send_json({"action": "stop", "cam_id": cam_id})
+        async with state_lock:
+            active_cameras.discard(cam_id)
+        await broadcast_json(build_snapshot())
+        return {"status": "ok", "detail": f"Stop command sent for {cam_id}"}
+    except Exception as e:
+        return {"status": "error", "detail": f"Failed to send stop: {e}"}
+
+
+@app.get("/stop_all")
+async def stop_all():
+    async with state_lock:
+        ws = rpi_connection
+    if ws is None:
+        return {"status": "error", "detail": "Raspberry Pi not connected"}
+    try:
+        await ws.send_json({"action": "stop_all"})
+        async with state_lock:
+            active_cameras.clear()
+        await broadcast_json(build_snapshot())
+        return {"status": "ok", "detail": "Stop all command sent"}
+    except Exception as e:
+        return {"status": "error", "detail": f"Failed to send stop_all: {e}"}
