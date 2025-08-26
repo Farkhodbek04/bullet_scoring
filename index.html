@@ -2,9 +2,10 @@
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>Target Scoring Dashboard (React)</title>
+  <title>Target Scoring Dashboard</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
+    :root { --maxw: 640px; }
     body{font-family:Arial,Helvetica,sans-serif;margin:20px}
     .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
     select,button{padding:6px 10px;font-size:14px}
@@ -12,13 +13,16 @@
     .status.err{color:#c00}
     .status.ok{color:#0a0}
     .score{margin-top:10px;font-size:16px}
-    img#preview{display:block;margin-top:12px;max-width:100%;border:1px solid #333}
+    .preview-wrap{margin-top:12px;max-width:var(--maxw)}
+    img#preview{display:block;width:100%;border:1px solid #333}
     .badge{display:inline-block;padding:2px 6px;border-radius:6px;background:#eee;font-size:12px;margin-left:6px}
     .badge.ok{background:#d7ffd7;border:1px solid #8ac78a}
     .badge.off{background:#ffe0e0;border:1px solid #e9a1a1}
     .pill{padding:2px 8px;border-radius:999px;border:1px solid #999;font-size:12px}
     .pill.on{background:#d7ffd7;border-color:#8ac78a}
     .pill.off{background:#eee}
+    .meta{font-size:12px;color:#444;margin-top:6px}
+    .muted{opacity:.8}
   </style>
 </head>
 <body>
@@ -32,7 +36,7 @@
     (function () {
       const { useEffect, useMemo, useRef, useState } = React;
 
-      const LS_KEY = "target-dashboard-state-v1";
+      const LS_KEY = "target-dashboard-state-v2";
       const loadLocal = () => { try { return JSON.parse(localStorage.getItem(LS_KEY) || "{}"); } catch { return {}; } };
       const saveLocal = (data) => { try { localStorage.setItem(LS_KEY, JSON.stringify(data)); } catch {} };
 
@@ -73,15 +77,16 @@
       }
 
       function App() {
-        // Initialize from localStorage so refresh shows instantly
+        // Initialize from localStorage for instant restore
         const init = loadLocal();
 
         const [cameras, setCameras] = useState(init.cameras || []);
         const [active, setActive] = useState(new Set(init.active || []));
         const [currentCam, setCurrentCam] = useState(init.currentCam || null);
         const [statusMsg, setStatusMsg] = useState("");
-        const [score, setScore] = useState(init.score ?? "N/A");
         const [imgSrc, setImgSrc] = useState(init.imgSrc || "");
+        const [score, setScore] = useState(init.score ?? "N/A");
+        const [pointsMap, setPointsMap] = useState(init.pointsMap || {}); // { cam_id: [points...] }
         const [startBusy, setStartBusy] = useState(false);
         const [stopBusy, setStopBusy] = useState(false);
 
@@ -92,9 +97,10 @@
             active: Array.from(active),
             currentCam,
             score,
-            imgSrc
+            imgSrc,
+            pointsMap
           });
-        }, [cameras, active, currentCam, score, imgSrc]);
+        }, [cameras, active, currentCam, score, imgSrc, pointsMap]);
 
         const wsUrl = useMemo(() => {
           const proto = location.protocol === 'https:' ? 'wss' : 'ws';
@@ -102,10 +108,11 @@
         }, []);
         const { ready: wsReady, lastMessage } = useStableWs(wsUrl);
 
-        // compute mutual exclusivity for buttons
+        // Derived UI states
         const isActive = currentCam ? active.has(currentCam) : false;
         const canStart = !!(cameras.length && (currentCam || cameras[0])) && !startBusy && !stopBusy && !isActive;
         const canStop  = !!currentCam && !stopBusy && isActive;
+        const detections = (currentCam && pointsMap[currentCam]) ? pointsMap[currentCam].length : 0;
 
         // Handle server messages
         useEffect(() => {
@@ -114,23 +121,29 @@
           if (lastMessage.action === "snapshot") {
             const list = Array.isArray(lastMessage.cameras) ? lastMessage.cameras : [];
             setCameras(list);
+
             const act = new Set(Array.isArray(lastMessage.active) ? lastMessage.active : []);
             setActive(act);
 
             const lr = lastMessage.last_results || {};
+            // Build a points map from snapshot
+            const pm = {};
+            for (const k in lr) {
+              pm[k] = lr[k].points || [];
+            }
+            setPointsMap(pm);
+
+            // If currentCam has snapshot data, hydrate it; else pick default
             if (currentCam && lr[currentCam]) {
               setScore(lr[currentCam].score ?? "N/A");
-              if (lr[currentCam].image) setImgSrc("data:image/jpeg;base64," + lr[currentCam].image);
+              setImgSrc(lr[currentCam].image ? "data:image/jpeg;base64," + lr[currentCam].image : "");
             } else if (!currentCam && list.length > 0) {
               const firstActive = list.find(c => act.has(c));
               const fallback = firstActive || list[0];
               setCurrentCam(fallback);
-              if (lr[fallback]) {
-                setScore(lr[fallback].score ?? "N/A");
-                if (lr[fallback].image) setImgSrc("data:image/jpeg;base64," + lr[fallback].image);
-              } else {
-                setScore("N/A"); setImgSrc("");
-              }
+              const data = lr[fallback] || {};
+              setScore(data.score ?? "N/A");
+              setImgSrc(data.image ? "data:image/jpeg;base64," + data.image : "");
             } else if (list.length === 0) {
               setStatusMsg("Pi offline / no cameras.");
               setCurrentCam(null); setScore("N/A"); setImgSrc("");
@@ -140,16 +153,35 @@
           }
 
           if (lastMessage.action === "result") {
-            if (lastMessage.cam_id && lastMessage.cam_id === currentCam) {
+            const cam = lastMessage.cam_id;
+            // update per-cam last points
+            setPointsMap(prev => ({ ...prev, [cam]: lastMessage.points || [] }));
+            // if it's the currently selected cam, show it immediately
+            if (cam && cam === currentCam) {
               setScore(lastMessage.score ?? "N/A");
               if (lastMessage.image) setImgSrc("data:image/jpeg;base64," + lastMessage.image);
             }
           }
         }, [lastMessage, currentCam]);
 
+        // Camera switch handler — loads last known snapshot/result
         const onChangeCam = (e) => {
           const v = e.target.value || null;
           setCurrentCam(v);
+          if (!v) {
+            setScore("N/A"); setImgSrc("");
+            return;
+          }
+          const s = loadLocal(); // best-effort hydrate from last snapshot in storage
+          const lr = (s && s.last_results) || null;
+          if (lr && lr[v]) {
+            setScore(lr[v].score ?? "N/A");
+            setImgSrc(lr[v].image ? "data:image/jpeg;base64," + lr[v].image : "");
+          } else {
+            // Fall back to pointsMap only; keep score (unknown) and clear image
+            setImgSrc("");
+            setScore("N/A");
+          }
           setStatusMsg("");
         };
 
@@ -192,7 +224,7 @@
           } finally {
             setStopBusy(false);
           }
-          // Keep last image & score visible after stop
+          // Keep last image & score visible
         };
 
         return React.createElement(
@@ -212,9 +244,7 @@
               },
               cameras.length === 0
                 ? React.createElement("option", { value: "" }, "-- No cameras --")
-                : cameras.map((c) =>
-                    React.createElement("option", { key: c, value: c }, c)
-                  )
+                : cameras.map((c) => React.createElement("option", { key: c, value: c }, c))
             ),
             React.createElement(
               "button",
@@ -242,17 +272,31 @@
               currentCam ? (isActive ? "active" : "idle") : "idle"
             )
           ),
+
+          React.createElement(
+            "div",
+            { className: "meta" },
+            currentCam ? `Detections on ${currentCam}: ${detections}` : "No camera selected"
+          ),
+
           React.createElement(
             "div",
             { className: "score" },
             "Score: ",
             React.createElement("span", { id: "score" }, String(score))
           ),
-          React.createElement("img", {
-            id: "preview",
-            alt: "preview",
-            src: imgSrc
-          })
+
+          React.createElement(
+            "div",
+            { className: "preview-wrap" },
+            React.createElement("img", { id: "preview", alt: "preview", src: imgSrc })
+          ),
+
+          React.createElement(
+            "div",
+            { className: "meta muted" },
+            "Tip: switching cameras shows the last known frame & score for that camera."
+          )
         );
       }
 

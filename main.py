@@ -7,43 +7,39 @@ from typing import Optional, Set, Dict, Any
 import numpy as np
 import cv2
 
+from model import BulletHoleModel  # YOLO + ring scoring
+
 app = FastAPI()
 
 # -----------------------------
 # Global state
 # -----------------------------
-rpi_connection: Optional[WebSocket] = None          # single Raspberry Pi/Ubuntu client
-available_cameras: list[str] = []                   # from Pi "register"
-frontend_connections: Set[WebSocket] = set()        # many admin browser clients
-state_lock = asyncio.Lock()                         # serialize state mutations
+rpi_connection: Optional[WebSocket] = None
+available_cameras: list[str] = []
+frontend_connections: Set[WebSocket] = set()
+state_lock = asyncio.Lock()
 
-# Track which cameras are actively streaming
+# Active cameras (started)
 active_cameras: Set[str] = set()
 
-# Cache last result per camera: {"score": int, "image": base64_jpg}
+# Last result cache per cam: {"score": int, "image": base64_jpg, "points": [...]}
 last_results: Dict[str, Dict[str, Any]] = {}
 
+# Baseline handling per cam (state before soldier shoots)
+baseline_pending: Dict[str, bool] = {}   # armed by /start -> next processed frame is baseline
+baseline_score: Dict[str, int] = {}
+baseline_points: Dict[str, Any] = {}
 
 # -----------------------------
-# Dummy model (replace with real one later)
+# Load your trained model once
 # -----------------------------
-class DummyModel:
-    def detect(self, image):
-        return []  # demo: no detections
-model = DummyModel()
-
-def calculate_score(bullet_holes):
-    score = 0
-    for (x, y) in bullet_holes:
-        score += 10
-    return score
+model = BulletHoleModel(weights_path="best.pt", conf_thres=0.25)
 
 
 # -----------------------------
 # Utilities
 # -----------------------------
 async def broadcast_json(payload: dict):
-    """Send payload to all admin clients; remove any dead sockets."""
     dead = []
     for ws in list(frontend_connections):
         try:
@@ -57,12 +53,11 @@ async def broadcast_json(payload: dict):
             pass
 
 def build_snapshot() -> dict:
-    """Full state snapshot for (re)connecting admin clients."""
     return {
         "action": "snapshot",
         "cameras": available_cameras,
         "active": list(active_cameras),
-        "last_results": last_results,  # { cam_id: {score, image(b64)} }
+        "last_results": last_results,  # { cam_id: { score, image(b64), points:[{x,y,conf,ring,score}] } }
     }
 
 
@@ -71,7 +66,6 @@ def build_snapshot() -> dict:
 # -----------------------------
 @app.get("/")
 async def serve_frontend():
-    """Serve index.html from the same directory."""
     with open("index.html", "r", encoding="utf-8") as f:
         return HTMLResponse(content=f.read(), status_code=200)
 
@@ -79,20 +73,17 @@ async def serve_frontend():
 @app.websocket("/ws/rpi")
 async def ws_rpi_endpoint(websocket: WebSocket):
     """
-    WebSocket for Raspberry Pi/Ubuntu client.
-
-    Pi sends:
+    RPi/Ubuntu capture client socket.
+    Client -> Server actions:
       - {"action":"register","cameras":[...]}
-      - {"action":"frame","cam_id":"cam1","frame":"<base64 jpg>"}
-
-    Server sends:
+      - {"action":"frame","cam_id":"cam1","frame":"<base64 jpeg>"}
+    Server -> Client actions:
       - {"action":"start","cam_id":"cam1"}
       - {"action":"stop","cam_id":"cam1"}
       - {"action":"stop_all"}
     """
     global rpi_connection, available_cameras
     await websocket.accept()
-
     async with state_lock:
         rpi_connection = websocket
 
@@ -107,7 +98,9 @@ async def ws_rpi_endpoint(websocket: WebSocket):
                     cams = []
                 async with state_lock:
                     available_cameras = cams
-                    active_cameras.intersection_update(cams)  # drop actives that disappeared
+                    active_cameras.intersection_update(cams)
+                    for c in cams:
+                        baseline_pending.setdefault(c, False)
                 await broadcast_json(build_snapshot())
 
             elif action == "frame":
@@ -117,36 +110,59 @@ async def ws_rpi_endpoint(websocket: WebSocket):
                     continue
 
                 try:
+                    # Decode JPEG -> BGR
                     frame_bytes = base64.b64decode(frame_b64)
                     jpg_array = np.frombuffer(frame_bytes, dtype=np.uint8)
                     frame = cv2.imdecode(jpg_array, cv2.IMREAD_COLOR)
                     if frame is None:
                         continue
 
-                    bullet_holes = model.detect(frame)
-                    score = calculate_score(bullet_holes)
+                    # 1) Detect bullet holes (x,y,conf)
+                    det_points = model.detect(frame)
 
-                    for (x, y) in bullet_holes:
-                        cv2.circle(frame, (x, y), radius=15, color=(0, 0, 255), thickness=3)
+                    # 2) Score each detection by ring distance to center
+                    scored_points, raw_score = model.score_points(det_points, frame, cam_id)
+
+                    # 3) Handle baseline: first processed frame after Start is cached
+                    async with state_lock:
+                        if baseline_pending.get(cam_id, False):
+                            baseline_score[cam_id] = raw_score
+                            baseline_points[cam_id] = scored_points
+                            baseline_pending[cam_id] = False
+
+                    # 4) Visualize detections
+                    for p in scored_points:
+                        cv2.circle(frame, (int(p["x"]), int(p["y"])), radius=15, color=(0, 0, 255), thickness=3)
 
                     ok, buffer = cv2.imencode(".jpg", frame)
                     if not ok:
                         continue
                     annotated_b64 = base64.b64encode(buffer).decode("utf-8")
 
+                    # 5) Effective score = current - baseline
                     async with state_lock:
-                        last_results[cam_id] = {"score": score, "image": annotated_b64}
+                        base = baseline_score.get(cam_id, 0)
+                    effective_score = max(0, raw_score - base)
+
+                    # 6) Cache last result for snapshot/reconnect
+                    async with state_lock:
+                        last_results[cam_id] = {
+                            "score": effective_score,
+                            "image": annotated_b64,
+                            "points": scored_points,  # x,y,conf,ring,score
+                        }
+
                 except Exception:
                     continue
 
+                # 7) Broadcast realtime result
                 await broadcast_json({
                     "action": "result",
                     "cam_id": cam_id,
-                    "score": score,
-                    "image": annotated_b64
+                    "score": effective_score,
+                    "image": annotated_b64,
+                    "points": scored_points,
                 })
-
-            # ignore unknown actions
 
     except WebSocketDisconnect:
         pass
@@ -159,19 +175,20 @@ async def ws_rpi_endpoint(websocket: WebSocket):
             available_cameras = []
             active_cameras.clear()
             last_results.clear()
+            baseline_pending.clear()
+            baseline_score.clear()
+            baseline_points.clear()
         await broadcast_json(build_snapshot())
 
 
 @app.websocket("/ws/client")
 async def ws_client_endpoint(websocket: WebSocket):
-    """WebSocket for admin browser clients."""
+    """Admin browser clients connect here to receive snapshots and realtime results."""
     await websocket.accept()
     async with state_lock:
         frontend_connections.add(websocket)
-
-    # Send a full snapshot immediately (so refresh restores state)
     try:
-        await websocket.send_json(build_snapshot())
+        await websocket.send_json(build_snapshot())  # hydrate immediately (supports refresh)
     except Exception:
         async with state_lock:
             frontend_connections.discard(websocket)
@@ -179,8 +196,7 @@ async def ws_client_endpoint(websocket: WebSocket):
 
     try:
         while True:
-            # keepalive; updates are pushed from elsewhere
-            await asyncio.sleep(60)
+            await asyncio.sleep(60)  # keepalive
     except WebSocketDisconnect:
         pass
     except Exception:
@@ -192,7 +208,7 @@ async def ws_client_endpoint(websocket: WebSocket):
 
 @app.get("/start/{cam_id}")
 async def start_camera(cam_id: str):
-    """Tell the Pi to start streaming a given camera."""
+    """Start streaming a given camera and arm baseline for the next processed frame."""
     async with state_lock:
         ws = rpi_connection
         cams = set(available_cameras)
@@ -202,7 +218,6 @@ async def start_camera(cam_id: str):
     if cam_id not in cams:
         return {"status": "error", "detail": f"Camera {cam_id} not available"}
 
-    # Guard duplicate start
     if already_active:
         return {"status": "ok", "detail": f"{cam_id} already running"}
 
@@ -210,6 +225,9 @@ async def start_camera(cam_id: str):
         await ws.send_json({"action": "start", "cam_id": cam_id})
         async with state_lock:
             active_cameras.add(cam_id)
+            baseline_pending[cam_id] = True   # next processed frame becomes baseline
+            baseline_score.pop(cam_id, None)
+            baseline_points.pop(cam_id, None)
         await broadcast_json(build_snapshot())
         return {"status": "ok", "detail": f"Start command sent for {cam_id}"}
     except Exception as e:
@@ -218,14 +236,13 @@ async def start_camera(cam_id: str):
 
 @app.get("/stop/{cam_id}")
 async def stop_camera(cam_id: str):
-    """Tell the Pi to stop streaming a given camera (keep last image/score cached)."""
+    """Stop streaming a given camera (last image/score are preserved for the UI)."""
     async with state_lock:
         ws = rpi_connection
         is_active = cam_id in active_cameras
     if ws is None:
         return {"status": "error", "detail": "Raspberry Pi not connected"}
 
-    # Guard duplicate stop
     if not is_active:
         return {"status": "ok", "detail": f"{cam_id} already stopped"}
 
@@ -241,6 +258,7 @@ async def stop_camera(cam_id: str):
 
 @app.get("/stop_all")
 async def stop_all():
+    """Stop all cameras (debug helper)."""
     async with state_lock:
         ws = rpi_connection
     if ws is None:

@@ -11,9 +11,9 @@ import websockets
 SERVER_WS_URL = "ws://0.0.0.0:8000/ws/rpi"
 
 # Tuning
-FPS = 20
+FPS = 2
 JPEG_QUALITY = 30
-RECONNECT_DELAY_SEC = 0.001
+RECONNECT_DELAY_SEC = 2.0
 
 CAMERAS_JSON = Path(__file__).with_name("cameras.json")  # same folder as script
 
@@ -25,10 +25,8 @@ def open_capture_from_source(source):
     """
     if isinstance(source, str) and source.isdigit():
         source = int(source)
-
     if isinstance(source, int):
         return cv2.VideoCapture(source, cv2.CAP_V4L2)
-
     return cv2.VideoCapture(source)
 
 
