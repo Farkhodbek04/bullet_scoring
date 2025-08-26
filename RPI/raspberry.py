@@ -11,9 +11,9 @@ import websockets
 SERVER_WS_URL = "ws://0.0.0.0:8000/ws/rpi"
 
 # Tuning
-FPS = 2
-JPEG_QUALITY = 30
-RECONNECT_DELAY_SEC = 2.0
+FPS = 15
+JPEG_QUALITY = 60
+RECONNECT_DELAY_SEC = 0.1
 
 CAMERAS_JSON = Path(__file__).with_name("cameras.json")  # same folder as script
 
