@@ -2,6 +2,7 @@
 from __future__ import annotations
 from typing import List, Tuple, Dict, Any, Optional
 import os
+import threading
 import numpy as np
 import cv2
 
@@ -43,10 +44,13 @@ class BulletHoleModel:
     def __init__(self, weights_path: str = MODEL_WEIGHTS, conf_thres: float = 0.25):
         self.model = YOLO(weights_path)
         self.conf_thres = conf_thres
+        self._predict_lock = threading.Lock()  # make YOLO calls thread-safe
+
         # Optional warmup to reduce first-frame latency
         try:
             dummy = np.zeros((640, 640, 3), dtype=np.uint8)
-            _ = self.model.predict(dummy, verbose=False, conf=self.conf_thres)
+            with self._predict_lock:
+                _ = self.model.predict(dummy, verbose=False, conf=self.conf_thres)
         except Exception:
             pass
 
@@ -57,7 +61,8 @@ class BulletHoleModel:
         Returns: [{"x": int, "y": int, "conf": float}, ...]
         Coordinates are pixel centers of predicted bullet holes.
         """
-        results = self.model.predict(frame_bgr, verbose=False, conf=self.conf_thres)
+        with self._predict_lock:
+            results = self.model.predict(frame_bgr, verbose=False, conf=self.conf_thres)
         if not results:
             return []
         r = results[0]

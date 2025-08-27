@@ -36,7 +36,7 @@
     (function () {
       const { useEffect, useMemo, useRef, useState } = React;
 
-      const LS_KEY = "target-dashboard-state-v2";
+      const LS_KEY = "target-dashboard-state-v3";
       const loadLocal = () => { try { return JSON.parse(localStorage.getItem(LS_KEY) || "{}"); } catch { return {}; } };
       const saveLocal = (data) => { try { localStorage.setItem(LS_KEY, JSON.stringify(data)); } catch {} };
 
@@ -86,21 +86,14 @@
         const [statusMsg, setStatusMsg] = useState("");
         const [imgSrc, setImgSrc] = useState(init.imgSrc || "");
         const [score, setScore] = useState(init.score ?? "N/A");
-        const [pointsMap, setPointsMap] = useState(init.pointsMap || {}); // { cam_id: [points...] }
+        const [lastMap, setLastMap] = useState(init.lastMap || {}); // cam_id -> {score, image, points}
         const [startBusy, setStartBusy] = useState(false);
         const [stopBusy, setStopBusy] = useState(false);
 
         // Persist to localStorage
         useEffect(() => {
-          saveLocal({
-            cameras,
-            active: Array.from(active),
-            currentCam,
-            score,
-            imgSrc,
-            pointsMap
-          });
-        }, [cameras, active, currentCam, score, imgSrc, pointsMap]);
+          saveLocal({ cameras, active: Array.from(active), currentCam, score, imgSrc, lastMap });
+        }, [cameras, active, currentCam, score, imgSrc, lastMap]);
 
         const wsUrl = useMemo(() => {
           const proto = location.protocol === 'https:' ? 'wss' : 'ws';
@@ -112,7 +105,8 @@
         const isActive = currentCam ? active.has(currentCam) : false;
         const canStart = !!(cameras.length && (currentCam || cameras[0])) && !startBusy && !stopBusy && !isActive;
         const canStop  = !!currentCam && !stopBusy && isActive;
-        const detections = (currentCam && pointsMap[currentCam]) ? pointsMap[currentCam].length : 0;
+        const detections = (currentCam && lastMap[currentCam] && Array.isArray(lastMap[currentCam].points))
+          ? lastMap[currentCam].points.length : 0;
 
         // Handle server messages
         useEffect(() => {
@@ -126,24 +120,27 @@
             setActive(act);
 
             const lr = lastMessage.last_results || {};
-            // Build a points map from snapshot
-            const pm = {};
-            for (const k in lr) {
-              pm[k] = lr[k].points || [];
-            }
-            setPointsMap(pm);
+            // Normalize to lastMap
+            const nm = {};
+            Object.keys(lr).forEach(k => {
+              nm[k] = {
+                score: lr[k]?.score ?? "N/A",
+                image: lr[k]?.image ? "data:image/jpeg;base64," + lr[k].image : "",
+                points: lr[k]?.points || []
+              };
+            });
+            setLastMap(nm);
 
-            // If currentCam has snapshot data, hydrate it; else pick default
-            if (currentCam && lr[currentCam]) {
-              setScore(lr[currentCam].score ?? "N/A");
-              setImgSrc(lr[currentCam].image ? "data:image/jpeg;base64," + lr[currentCam].image : "");
+            if (currentCam && nm[currentCam]) {
+              setScore(nm[currentCam].score ?? "N/A");
+              setImgSrc(nm[currentCam].image || "");
             } else if (!currentCam && list.length > 0) {
               const firstActive = list.find(c => act.has(c));
               const fallback = firstActive || list[0];
               setCurrentCam(fallback);
-              const data = lr[fallback] || {};
+              const data = nm[fallback] || {};
               setScore(data.score ?? "N/A");
-              setImgSrc(data.image ? "data:image/jpeg;base64," + data.image : "");
+              setImgSrc(data.image || "");
             } else if (list.length === 0) {
               setStatusMsg("Pi offline / no cameras.");
               setCurrentCam(null); setScore("N/A"); setImgSrc("");
@@ -154,34 +151,28 @@
 
           if (lastMessage.action === "result") {
             const cam = lastMessage.cam_id;
-            // update per-cam last points
-            setPointsMap(prev => ({ ...prev, [cam]: lastMessage.points || [] }));
-            // if it's the currently selected cam, show it immediately
+            const entry = {
+              score: lastMessage.score ?? "N/A",
+              image: lastMessage.image ? "data:image/jpeg;base64," + lastMessage.image : "",
+              points: lastMessage.points || []
+            };
+            setLastMap(prev => ({ ...prev, [cam]: entry }));
+
             if (cam && cam === currentCam) {
-              setScore(lastMessage.score ?? "N/A");
-              if (lastMessage.image) setImgSrc("data:image/jpeg;base64," + lastMessage.image);
+              setScore(entry.score);
+              setImgSrc(entry.image);
             }
           }
         }, [lastMessage, currentCam]);
 
-        // Camera switch handler — loads last known snapshot/result
+        // Camera switch handler — loads last known frame/score
         const onChangeCam = (e) => {
           const v = e.target.value || null;
           setCurrentCam(v);
-          if (!v) {
-            setScore("N/A"); setImgSrc("");
-            return;
-          }
-          const s = loadLocal(); // best-effort hydrate from last snapshot in storage
-          const lr = (s && s.last_results) || null;
-          if (lr && lr[v]) {
-            setScore(lr[v].score ?? "N/A");
-            setImgSrc(lr[v].image ? "data:image/jpeg;base64," + lr[v].image : "");
-          } else {
-            // Fall back to pointsMap only; keep score (unknown) and clear image
-            setImgSrc("");
-            setScore("N/A");
-          }
+          if (!v) { setScore("N/A"); setImgSrc(""); return; }
+          const data = lastMap[v] || {};
+          setScore(data.score ?? "N/A");
+          setImgSrc(data.image || "");
           setStatusMsg("");
         };
 
@@ -295,7 +286,7 @@
           React.createElement(
             "div",
             { className: "meta muted" },
-            "Tip: switching cameras shows the last known frame & score for that camera."
+            "Tip: switching cameras shows that camera's last frame & score instantly."
           )
         );
       }
